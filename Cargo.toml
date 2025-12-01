@@ -6,11 +6,17 @@ license = "Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/tych0/huldufolk"
 repository = "https://github.com/tych0/huldufolk"
-edition = "2018"
+edition = "2024"
 
 [dependencies]
-serde = "1"
-serde_derive = "1"
-toml = "0.4"
+caps = "0.5"
 libc = "0.2"
-capabilities = "*"
+toml = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
