@@ -1,28 +1,52 @@
 #![deny(warnings)]
 
-extern crate toml;
-#[macro_use]
-extern crate serde_derive;
-extern crate capabilities;
-extern crate libc;
-
-use std::convert::From;
-use std::ffi::{CString, OsString};
+use caps::{CapSet, Capability};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::process::exit;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, exit};
+use std::str::FromStr;
 
-// The "prctl" library depends on nix, which itself depends on some other stuff. We only need these
-// few defines, so let's just hard code them here. Plus, it doesn't have the ambient ones.
-const PR_SET_SECUREBITS: libc::c_int = 28;
-const SECBIT_NOROOT: libc::c_int = 0x01;
-const PR_CAP_AMBIENT: libc::c_int = 47;
-const PR_CAP_AMBIENT_RAISE: libc::c_int = 2;
+use libc::{PR_SET_NO_NEW_PRIVS, PR_SET_SECUREBITS, c_ulong};
+const SECBIT_NOROOT: c_ulong = 0x01;
+const DEFAULT_CONFIG_PATH: Option<&'static str> = option_env!("DEFAULT_CONFIG_PATH");
+
+macro_rules! fail {
+    ($($arg:tt)*) => ({
+        let msg = format!("ERROR: {}\n", format_args!($($arg)*));
+        let _ = std::io::stderr().write_all(msg.as_bytes());
+        exit(1)
+    })
+}
 
 #[derive(Deserialize)]
 struct Config {
     helpers: Vec<Helper>,
+}
+
+impl Config {
+    // Modernization & Refactoring: Encapsulated configuration loading and parsing.
+    fn load(path: &str) -> Self {
+        let raw = fs::read_to_string(path)
+            .unwrap_or_else(|e| fail!("couldn't read config file {}: {}", path, e));
+
+        toml::from_str(&raw)
+            .unwrap_or_else(|e| fail!("couldn't parse config file {}: {}", path, e))
+    }
+
+    fn find_helper(&self, args: &[OsString]) -> &Helper {
+        // Note: The kernel guarantees argv[0] exists for usermode helpers.
+        // We panic/fail if it's missing.
+        let name = args.get(0).expect("program doesn't have a 0 arg?");
+        self.helpers
+            .iter()
+            .find(|s| s.allowed(args))
+            .unwrap_or_else(|| fail!("invalid usermode helper {:?}", name))
+    }
 }
 
 #[derive(Deserialize)]
@@ -30,155 +54,171 @@ struct Helper {
     path: String,
     argc: Option<usize>,
     #[serde(deserialize_with = "deserialize_caps", default)]
-    capabilities: Option<capabilities::Capabilities>,
+    // Modernization: Use 'caps' crate (Hashet) instead of the old 'capabilities'.
+    capabilities: Option<HashSet<Capability>>,
 }
 
 impl Helper {
-    fn allowed(&self, args: &Vec<OsString>) -> bool {
-        if !args
-            .get(0)
-            .map_or(false, |a| a == &OsString::from(&self.path))
-        {
+    fn allowed(&self, args: &[OsString]) -> bool {
+        if !args.get(0).map_or(false, |a| a == self.path.as_str()) {
             return false;
         }
-
-        if self.argc.map_or(false, |argc| args.len() != argc) {
-            return false;
+        if let Some(argc) = self.argc {
+            if args.len() != argc {
+                return false;
+            }
         }
+        true
+    }
 
-        return true;
+    fn execute(&self, args: &[OsString]) {
+        // Modernization: Use std::process::Command instead of unsafe libc::execvp.
+        // We set up a minimal environment for the new process.
+        let mut cmd = Command::new(&self.path);
+
+        cmd.env_clear()
+            .env("HOME", "/")
+            .env("TERM", "linux")
+            .env("PATH", "/sbin:/bin:/usr/sbin:/usr/bin")
+            .args(args.iter().skip(1))
+            .arg0(&self.path);
+
+        let err = cmd.exec();
+        fail!("exec failed: {}", err);
     }
 }
 
-fn deserialize_caps<'de, D>(deserializer: D) -> Result<Option<capabilities::Capabilities>, D::Error>
+// Modernization: Migrating to the modern 'caps' crate logic.
+// The legacy libcap string format (e.g., "= cap_sys_module+eip") is still supported,
+// but flags are ignored to enforce a strict allowlist.
+fn deserialize_caps<'de, D>(deserializer: D) -> Result<Option<HashSet<Capability>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s: &str = serde::Deserialize::deserialize(deserializer)?;
-    if s == "" {
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let clean_s = s.trim().trim_start_matches("=").trim();
+
+    if clean_s.is_empty() {
         return Ok(None);
     }
-    return s
-        .parse::<capabilities::Capabilities>()
-        .map_err(|_| serde::de::Error::custom(format!("invalid caps {}", s)))
-        .map(|v| Some(v));
+
+    let caps = clean_s
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let name = part.split(|c| c == '+' || c == '-').next().unwrap_or(part);
+            Capability::from_str(&name.to_uppercase())
+                .map_err(|_| serde::de::Error::custom(format!("bad caps {}", name)))
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    Ok(Some(caps))
 }
 
-const DEFAULT_CONFIG_PATH: Option<&'static str> = option_env!("DEFAULT_CONFIG_PATH");
-
-macro_rules! fail {
-    ($($arg:tt)*) => ({
-        let log = std::fmt::format(format_args!($($arg)*))+"\n";
-	let _ = std::io::stderr().write(log.as_ref());
-	std::process::exit(1)
-    })
-}
-
-/*
- * TODO: should we exit(1) if this fails? It would be nice to know, but also this could stop
- * peoples' systems from booting...
- */
-fn log_to_kmsg() {
-    let file = match fs::OpenOptions::new().write(true).open("/dev/kmsg") {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("couldn't open /dev/kmsg: {}", e);
-            return;
+// Security Hardening: Enforce a deterministic FD state to prevent any
+// attacker-controlled descriptors from leaking into the target command.
+fn sanitize_fds() {
+    let nfd = match fs::OpenOptions::new().read(true).write(true).open("/dev/null") {
+        Ok(f) => f.into_raw_fd(),
+        Err(_) => exit(2),
+    };
+    let fail_if = |failed: bool| {
+        if failed {
+            exit(3);
         }
     };
 
     unsafe {
-        let ret = libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-        if ret < 0 {
-            let err = CString::new("couldn't dup2 over stderr").expect("constant string");
-            libc::perror(err.as_ptr());
+        // Sanitize standards streams (0, 1 2) -> /dev/null
+        fail_if(libc::dup2(nfd, libc::STDIN_FILENO) < 0);
+        fail_if(libc::dup2(nfd, libc::STDOUT_FILENO) < 0);
+        fail_if(libc::dup2(nfd, libc::STDERR_FILENO) < 0);
+
+        // Close all others (3+).
+        fail_if(libc::syscall(libc::SYS_close_range, 3, !0u32, 0) < 0);
+    }
+}
+
+// Logic change: Simplified to "best effort".
+// Removed 'eprintln' (since stderr is not yet connected) and 'CString' allocations.
+fn log_to_kmsg() {
+    if let Ok(f) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        unsafe {
+            libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO);
+        }
+    }
+}
+
+// Refactoring: Isolate privilege restriction (caps, NNP) into a dedidcated function.
+fn priv_restrict(caps_to_apply: &HashSet<Capability>) {
+    // 1. Disable "Magic Root" behavior.
+    // Instruct kernel NOT to automatically grant full capabilities during execve.
+    unsafe {
+        if libc::prctl(PR_SET_SECUREBITS, SECBIT_NOROOT, 0, 0, 0) < 0 {
+            fail!("couln't set securebits");
+        }
+    }
+
+    // 2. Drop all capabilities from Effective, Inheritable and Permitted sets,
+    // except the ones explicitly allowed in configuration.
+    for set in [CapSet::Effective, CapSet::Inheritable, CapSet::Permitted] {
+        caps::set(None, set, caps_to_apply)
+            .unwrap_or_else(|e| fail!("couldn't apply caps to {:?}: {}", set, e));
+    }
+
+    // 3. Add allowed capabilities to the Ambient set so they persist across execve.
+    for cap in caps_to_apply {
+        caps::raise(None, CapSet::Ambient, *cap)
+            .unwrap_or_else(|e| fail!("couldn't set ambient cap {:?}: {}", cap, e));
+    }
+
+    // 4. Security Hardening: Set the NNP (No New Privileges) bit.
+    // NNP complements SECBIT_NOROOT by ensuring privileges cannot be re-acquired
+    // after execve (e.g., through setuid/setgid bit or file capabilities).
+    unsafe {
+        if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+            fail!("failed to set nnp");
         }
     }
 }
 
 fn main() {
-    let _ = std::env::var("HULDUFOLK_DEBUG").map_err(|_| log_to_kmsg());
+    sanitize_fds();
+    log_to_kmsg();
 
     let path = DEFAULT_CONFIG_PATH.unwrap_or("/etc/usermode-helper.conf");
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|e| fail!("couldn't read config file {}: {}", path, e));
+    let config = Config::load(path);
 
-    let config: Config = toml::from_str(&raw).unwrap_or_else(|e| {
-        fail!("couldn't parse config file {}: {}", path, e);
-    });
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let helper = config.find_helper(&args);
 
-    let name = std::env::args()
-        .nth(0)
-        .expect("program doesn't have a 0 arg?");
-
-    // don't warn about empty UMHs.
-    if name.is_empty() {
-        exit(0);
+    // Restrict privileges based on configured capabilities.
+    if let Some(caps) = &helper.capabilities {
+        priv_restrict(caps);
     }
 
-    let args = std::env::args_os().collect();
-    let thing = config
-        .helpers
-        .iter()
-        .find(|s| s.allowed(&args))
-        .unwrap_or_else(|| {
-            fail!("invalid usermode helper {}", name);
-        });
+    /* ALTERNATIVE APPROACH ("Zero-Trust"):
+     * If no capabilties are defined (empty set), strip all privileges.
+     *
+     *  let empty_caps = HashSet::new();
+     *  let caps = helper.capabilities.as_ref().unwrap_or(&empty_caps);
+     *  priv_restrict(caps);
+     */
 
-    if let Some(capabilities) = &thing.capabilities {
-        unsafe {
-            let ret = libc::prctl(PR_SET_SECUREBITS, SECBIT_NOROOT, 0, 0, 0);
-            if ret < 0 {
-                let err = CString::new("couldn't set securebits").expect("constant string");
-                libc::perror(err.as_ptr());
-            }
-        }
-
-        if let Err(e) = capabilities.apply() {
-            fail!("couldn't apply caps: {}", e)
-        }
-
-        for cap in 0..capabilities::Capability::CAP_LAST_CAP as u32 {
-            if !capabilities.check(cap.into(), capabilities::Flag::Inheritable) {
-                continue;
-            }
-
-            unsafe {
-                let ret = libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0);
-                if ret < 0 {
-                    let err = CString::new(format!("couldn't set ambient cap {}", cap)).expect("constant string");
-                    libc::perror(err.as_ptr());
-                }
-            }
+    if std::env::var("HULDUFOLK_DEBUG").is_ok() {
+        let msg = format!("-- DEBUG CAPS for {} --\n", helper.path);
+        let _ = std::io::stderr().write_all(msg.as_bytes());
+        for set in [
+            CapSet::Effective,
+            CapSet::Inheritable,
+            CapSet::Permitted,
+            CapSet::Ambient,
+        ] {
+            let c = caps::read(None, set).unwrap_or_default();
+            let line = format!("{:?}: {:?}\n", set, c);
+            let _ = std::io::stderr().write_all(line.as_bytes());
         }
     }
 
-    let c_exe = CString::new(thing.path.clone()).unwrap_or_else(|e| {
-        fail!("couldn't create exec executable name: {}", e);
-    });
-
-    let c_args: Vec<_> = std::env::args()
-        .skip(1)
-        .map(|a| {
-            CString::new(a).unwrap_or_else(|e| {
-                fail!("couldn't create exec args array: {}", e);
-            })
-        })
-        .collect();
-
-    let ptr_args: Vec<_> = std::iter::once(c_exe.as_ptr())
-        .chain(
-            c_args
-                .iter()
-                .map(|a| a.as_ptr())
-                .chain(std::iter::once(std::ptr::null())),
-        )
-        .collect();
-
-    unsafe {
-        libc::execvp(c_exe.as_ptr(), ptr_args.as_ptr());
-        let err = CString::new("couldn't execvp").expect("constant string");
-        libc::perror(err.as_ptr());
-    }
-    exit(1);
+    helper.execute(&args);
 }
