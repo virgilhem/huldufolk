@@ -99,7 +99,7 @@ where
     let clean_s = s.trim().trim_start_matches("=").trim();
 
     if clean_s.is_empty() {
-        return Ok(None);
+        return Ok(Some(HashSet::new()));
     }
 
     let caps = clean_s
