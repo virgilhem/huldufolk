@@ -117,7 +117,7 @@ where
 
 // Security Hardening: Enforce a deterministic FD state to prevent any
 // attacker-controlled descriptors from leaking into the target command.
-fn sanitize_fds() {
+fn sanitize_fds(preserve_stderr: bool) {
     let nfd = match fs::OpenOptions::new().read(true).write(true).open("/dev/null") {
         Ok(f) => f.into_raw_fd(),
         Err(_) => exit(2),
@@ -132,7 +132,9 @@ fn sanitize_fds() {
         // Sanitize standards streams (0, 1 2) -> /dev/null
         fail_if(libc::dup2(nfd, libc::STDIN_FILENO) < 0);
         fail_if(libc::dup2(nfd, libc::STDOUT_FILENO) < 0);
-        fail_if(libc::dup2(nfd, libc::STDERR_FILENO) < 0);
+        if !preserve_stderr {
+            fail_if(libc::dup2(nfd, libc::STDERR_FILENO) < 0);
+        }
 
         // Close all others (3+).
         fail_if(libc::syscall(libc::SYS_close_range, 3, !0u32, 0) < 0);
@@ -183,8 +185,15 @@ fn priv_restrict(caps_to_apply: &HashSet<Capability>) {
 }
 
 fn main() {
-    sanitize_fds();
-    log_to_kmsg();
+    // Debug logic: Logs are sent to kmsg by default (production).
+    // They are preserved on stderr only when HULDUFOLK_DEBUG is set, to allow output
+    // capture for manual debugging or integration testing.
+    let debug_mode = std::env::var("HULDUFOLK_DEBUG").is_ok();
+
+    sanitize_fds(debug_mode);
+    if !debug_mode {
+        log_to_kmsg();
+    }
 
     let path = DEFAULT_CONFIG_PATH.unwrap_or("/etc/usermode-helper.conf");
     let config = Config::load(path);
@@ -196,7 +205,6 @@ fn main() {
     if let Some(caps) = &helper.capabilities {
         priv_restrict(caps);
     }
-
     /* ALTERNATIVE APPROACH ("Zero-Trust"):
      * If no capabilties are defined (empty set), strip all privileges.
      *
@@ -205,7 +213,7 @@ fn main() {
      *  priv_restrict(caps);
      */
 
-    if std::env::var("HULDUFOLK_DEBUG").is_ok() {
+    if debug_mode {
         let msg = format!("-- DEBUG CAPS for {} --\n", helper.path);
         let _ = std::io::stderr().write_all(msg.as_bytes());
         for set in [
