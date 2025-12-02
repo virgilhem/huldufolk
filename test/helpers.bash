@@ -12,10 +12,13 @@ function real-usermode-helper {
         args=""
     fi
     pushd "${TEMP_DIR}"
+
+    : "${UMH_BIN:=${ROOT_DIR}/target/debug/usermode-helper}"
+
     # We always run the helper in a user namespace, that way we can check
     # capabilities stuff without having root. It doesn't hurt anything else
     # (except for dmesg, which we have a special test for anyway).
-    run unshare -Uur bash -c "HULDUFOLK_DEBUG=1 exec -a $1 \"${ROOT_DIR}/target/debug/usermode-helper\" $args"
+    run unshare -Uur bash -c "HULDUFOLK_DEBUG=1 exec -a $1 \"$UMH_BIN\" $args"
     popd
     echo "$output"
 }
